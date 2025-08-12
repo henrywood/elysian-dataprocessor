@@ -1,0 +1,356 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  COMPOSER_CACHE_DIR: ~/.composer/cache
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ['8.1', '8.2', '8.3']
+        composer-flags: ['', '--prefer-lowest']
+        exclude:
+          - php-version: '8.2'
+            composer-flags: '--prefer-lowest'
+          - php-version: '8.3'
+            composer-flags: '--prefer-lowest'
+    
+    name: PHP ${{ matrix.php-version }} ${{ matrix.composer-flags }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-version }}
+        extensions: mbstring, xml, ctype, iconv, intl, pdo, zip, dom, curl, fileinfo
+        coverage: xdebug
+        tools: composer:v2
+    
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+    
+    - name: Cache composer dependencies
+      uses: actions/cache@v3
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-composer-${{ matrix.php-version }}-
+          ${{ runner.os }}-composer-
+    
+    - name: Validate composer.json and composer.lock
+      run: composer validate --strict
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction ${{ matrix.composer-flags }}
+    
+    - name: Run code style checks
+      run: |
+        if [ -f vendor/bin/php-cs-fixer ]; then
+          vendor/bin/php-cs-fixer fix --dry-run --diff --verbose
+        fi
+        if [ -f vendor/bin/phpcs ]; then
+          vendor/bin/phpcs
+        fi
+    
+    - name: Run static analysis
+      run: |
+        if [ -f vendor/bin/phpstan ]; then
+          vendor/bin/phpstan analyse
+        fi
+        if [ -f vendor/bin/psalm ]; then
+          vendor/bin/psalm
+        fi
+    
+    - name: Run tests
+      run: |
+        if [ -f vendor/bin/phpunit ]; then
+          vendor/bin/phpunit --coverage-clover=coverage.xml
+        elif [ -f vendor/bin/pest ]; then
+          vendor/bin/pest --coverage --coverage-clover=coverage.xml
+        else
+          echo "No test framework found"
+        fi
+    
+    - name: Upload coverage reports to Codecov
+      if: matrix.php-version == '8.1' && matrix.composer-flags == ''
+      uses: codecov/codecov-action@v3
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        file: ./coverage.xml
+        flags: unittests
+        fail_ci_if_error: false
+
+  test-with-swoole:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ['8.1', '8.2', '8.3']
+    
+    name: PHP ${{ matrix.php-version }} with Swoole
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP with Swoole
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-version }}
+        extensions: mbstring, xml, ctype, iconv, intl, pdo, zip, dom, curl, fileinfo, swoole
+        coverage: xdebug
+        tools: composer:v2
+    
+    - name: Get composer cache directory
+      id: composer-cache
+      run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+    
+    - name: Cache composer dependencies
+      uses: actions/cache@v3
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-composer-swoole-${{ matrix.php-version }}-${{ hashFiles('**/composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-composer-swoole-${{ matrix.php-version }}-
+          ${{ runner.os }}-composer-
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction
+    
+    - name: Run Swoole-specific tests
+      run: |
+        if [ -f vendor/bin/phpunit ]; then
+          vendor/bin/phpunit --group swoole
+        elif [ -f vendor/bin/pest ]; then
+          vendor/bin/pest --group swoole
+        fi
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        env:
+          SERVICES: s3
+          DEBUG: 1
+          DATA_DIR: /tmp/localstack/data
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl -f http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        extensions: mbstring, xml, ctype, iconv, intl, pdo, zip, dom, curl, fileinfo
+        tools: composer:v2
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction
+    
+    - name: Setup AWS CLI for LocalStack
+      run: |
+        pip install awscli-local
+        awslocal s3 mb s3://test-bucket
+    
+    - name: Run integration tests
+      env:
+        AWS_ACCESS_KEY_ID: test
+        AWS_SECRET_ACCESS_KEY: test
+        AWS_DEFAULT_REGION: us-east-1
+        AWS_ENDPOINT_URL: http://localhost:4566
+        REDIS_URL: redis://localhost:6379
+      run: |
+        if [ -f vendor/bin/phpunit ]; then
+          vendor/bin/phpunit --group integration
+        elif [ -f vendor/bin/pest ]; then
+          vendor/bin/pest --group integration
+        fi
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        extensions: mbstring, xml, ctype, iconv, intl, pdo, zip, dom, curl, fileinfo
+        tools: composer:v2
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction
+    
+    - name: Run security checks
+      run: |
+        # Check for known security vulnerabilities in dependencies
+        composer audit
+        
+        # Run PHPMD for mess detection
+        if [ -f vendor/bin/phpmd ]; then
+          vendor/bin/phpmd src text cleancode,codesize,controversial,design,naming,unusedcode || true
+        fi
+        
+        # Run security scanner if available
+        if [ -f vendor/bin/security-checker ]; then
+          vendor/bin/security-checker security:check composer.lock
+        fi
+
+  performance:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        extensions: mbstring, xml, ctype, iconv, intl, pdo, zip, dom, curl, fileinfo, xdebug
+        tools: composer:v2
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction
+    
+    - name: Generate test data
+      run: |
+        # Create sample large files for performance testing
+        mkdir -p tests/fixtures
+        if [ ! -f tests/fixtures/large_dataset.csv ]; then
+          head -1 tests/fixtures/sample.csv > tests/fixtures/large_dataset.csv 2>/dev/null || echo "id,name,email" > tests/fixtures/large_dataset.csv
+          for i in {1..100000}; do
+            echo "$i,User$i,user$i@example.com" >> tests/fixtures/large_dataset.csv
+          done
+        fi
+    
+    - name: Run performance tests
+      run: |
+        if [ -f vendor/bin/phpunit ]; then
+          vendor/bin/phpunit --group performance
+        elif [ -f vendor/bin/pest ]; then
+          vendor/bin/pest --group performance
+        fi
+    
+    - name: Memory usage analysis
+      run: |
+        # Run memory profiling if configured
+        if [ -f vendor/bin/phpunit ]; then
+          php -d memory_limit=512M vendor/bin/phpunit --group memory
+        fi
+
+  docs:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        tools: composer:v2
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction
+    
+    - name: Generate API documentation
+      run: |
+        # Generate PHPDoc documentation if configured
+        if [ -f vendor/bin/phpdoc ]; then
+          vendor/bin/phpdoc
+        fi
+        
+        # Check documentation syntax if using other tools
+        if [ -f docs/conf.py ]; then
+          pip install sphinx
+          cd docs && sphinx-build -W -b html . _build/html
+        fi
+    
+    - name: Validate README and docs
+      run: |
+        # Check if README exists and has basic content
+        if [ ! -f README.md ]; then
+          echo "README.md is missing"
+          exit 1
+        fi
+        
+        # Validate documentation links
+        if command -v markdown-link-check &> /dev/null; then
+          markdown-link-check README.md || true
+        fi
+
+  package:
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.1'
+        tools: composer:v2
+    
+    - name: Install dependencies
+      run: composer install --prefer-dist --no-progress --no-interaction --no-dev --optimize-autoloader
+    
+    - name: Create package
+      run: |
+        # Archive the package excluding development files
+        tar -czf elysian-dataprocessor.tar.gz \
+          --exclude='tests' \
+          --exclude='.git*' \
+          --exclude='phpunit.xml*' \
+          --exclude='*.md' \
+          --exclude='composer.lock' \
+          .
+    
+    - name: Upload package artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: elysian-dataprocessor-package
+        path: elysian-dataprocessor.tar.gz
+        retention-days: 30
